@@ -1,22 +1,65 @@
 # ================================================================
-# Extended code for future steps (simulating measurement types, noise, fast bandwidth)
+# UNIFIED QUANTUM DENSITY ESTIMATION FRAMEWORK (IMPROVED)
+# Tests KDE on 5 distinct quantum state families + Real Data
+# Optimized with caching, fixed density functions, robust sampling
+# FIXED: real data subsampling error (n > population)
 # ================================================================
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from scipy.stats import norm, gamma
+from scipy.stats import norm
 from scipy.integrate import simpson
 from sklearn.mixture import GaussianMixture
 from sklearn.model_selection import KFold
-import time
+from tqdm import tqdm
+import h5py
+import requests
+import os
 import warnings
+import time
+from functools import lru_cache
 warnings.filterwarnings('ignore')
 
-# ==================== 1. Density functions for measurement types ====================
+# ==================== 0. Utilities ====================
+def download_file(url, local_filename):
+    if os.path.exists(local_filename):
+        return local_filename
+    print(f"📥 Downloading from: {url}")
+    with requests.get(url, stream=True) as r:
+        r.raise_for_status()
+        total_size = int(r.headers.get('content-length', 0))
+        with open(local_filename, 'wb') as f:
+            with tqdm(total=total_size, unit='B', unit_scale=True, desc=local_filename) as pbar:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+                    pbar.update(len(chunk))
+    return local_filename
 
+def load_h5_data(file_path):
+    with h5py.File(file_path, 'r') as f:
+        numeric_datasets = []
+        def find_numeric(name, obj):
+            if isinstance(obj, h5py.Dataset) and obj.dtype.kind in ('f', 'i', 'u'):
+                if len(obj.shape) <= 2:
+                    numeric_datasets.append((name, obj.shape))
+        f.visititems(find_numeric)
+        if not numeric_datasets:
+            raise ValueError("No numeric dataset found.")
+        selected = numeric_datasets[0][0]
+        data = f[selected][()]
+        if len(data.shape) > 1:
+            data = data.flatten()
+        return data
+
+def scale_data(data, target_range=(-4, 4)):
+    min_val, max_val = np.min(data), np.max(data)
+    if max_val - min_val == 0:
+        return np.zeros_like(data)
+    return (data - min_val) / (max_val - min_val) * (target_range[1] - target_range[0]) + target_range[0]
+
+# ==================== 1. Five Quantum Densities (correctly normalised) ====================
 def density_cat_state(x, alpha=2.0, sigma=1/np.sqrt(2)):
-    """Density of Homodyne measurement for Cat state"""
     mu = np.sqrt(2) * alpha
     sigma2 = sigma**2
     gauss1 = norm.pdf(x, loc=-mu, scale=sigma)
@@ -24,73 +67,66 @@ def density_cat_state(x, alpha=2.0, sigma=1/np.sqrt(2)):
     interference = (1 / (sigma * np.sqrt(2 * np.pi))) * np.exp(-mu**2 / sigma2) * np.cos(2 * mu * x / sigma2)
     return 0.5 * gauss1 + 0.5 * gauss2 + interference
 
-def density_heterodyne(x, alpha=2.0, sigma=1/np.sqrt(2)):
-    """Density of Heterodyne measurement - Q-function distribution"""
-    # Approximation: Q-function distribution for the Cat state is a mixture of Gaussians with interference
-    mu = np.sqrt(2) * alpha
-    sigma2 = sigma**2
-    # Q-function distribution with double width
-    sigma_q = sigma * np.sqrt(2)
-    gauss1 = norm.pdf(x, loc=-mu, scale=sigma_q)
-    gauss2 = norm.pdf(x, loc=mu, scale=sigma_q)
-    interference = (1 / (sigma_q * np.sqrt(2 * np.pi))) * np.exp(-mu**2 / (2*sigma2)) * np.cos(2 * mu * x / (2*sigma2))
-    return 0.5 * gauss1 + 0.5 * gauss2 + interference
-
 def density_squeezed(x, alpha=2.0, r=0.5):
-    """Density of Squeezed state - Squeezed Gaussian distribution"""
     sigma = np.exp(-r) / np.sqrt(2)
     return norm.pdf(x, loc=alpha, scale=sigma)
 
-# ==================== 2. Sampling from densities ====================
+def density_fermionic(x, mu=0.0, sigma=1.0, delta=0.5):
+    gauss = norm.pdf(x, loc=mu, scale=sigma)
+    depletion = 1 - delta * np.exp(-x**2 / (2 * (sigma/2)**2))
+    unnorm = gauss * np.maximum(depletion, 0.01)
+    norm_const = simpson(unnorm, x=x)
+    return unnorm / norm_const
 
-def sample_from_density(n, density_func, x_range=(-8, 8), **kwargs):
-    """Rejection sampling from any density"""
-    x_grid = np.linspace(x_range[0], x_range[1], 2000)
-    f_vals = density_func(x_grid, **kwargs)
-    M = 1.1 * np.max(f_vals)
-    samples = []
-    while len(samples) < n:
-        x_prop = np.random.uniform(x_range[0], x_range[1], size=n - len(samples))
-        u = np.random.uniform(0, M, size=n - len(samples))
-        f_prop = density_func(x_prop, **kwargs)
-        accept = u <= f_prop
-        samples.extend(x_prop[accept])
-    return np.array(samples[:n])
+def density_entangled_marginal(x, alpha=2.0, sigma=1.0, epsilon=0.3):
+    gauss = norm.pdf(x, loc=0, scale=sigma)
+    modulation = 1 + epsilon * np.cos(2 * alpha * x / sigma)
+    unnorm = gauss * np.maximum(modulation, 0)
+    norm_const = simpson(unnorm, x=x)
+    return unnorm / norm_const
 
-# ==================== 3. Epanechnikov kernel ====================
+def density_non_gaussian_thermal(x, mu=0.0, sigma=1.0, epsilon=0.2, k=2.0):
+    gauss = np.exp(-(x - mu)**2 / (2 * sigma**2))
+    modulation = 1 + epsilon * np.cos(k * x)
+    unnorm = gauss * np.maximum(modulation, 0)
+    norm_const = simpson(unnorm, x=x)
+    return unnorm / norm_const
 
+# ==================== 2. Optimised Sampling with Caching ====================
+class SampleCache:
+    def __init__(self):
+        self.cache = {}
+
+    def get(self, n, density_func, x_range, **kwargs):
+        key = (n, density_func.__name__, tuple(kwargs.items()), x_range)
+        if key not in self.cache:
+            samples = self._rejection_sample(n, density_func, x_range, **kwargs)
+            self.cache[key] = samples
+        return self.cache[key]
+
+    def _rejection_sample(self, n, density_func, x_range, **kwargs):
+        x_grid = np.linspace(x_range[0], x_range[1], 5000)
+        f_vals = density_func(x_grid, **kwargs)
+        M = 1.5 * np.max(f_vals)
+        samples = []
+        while len(samples) < n:
+            x_prop = np.random.uniform(x_range[0], x_range[1], size=n - len(samples))
+            u = np.random.uniform(0, M, size=n - len(samples))
+            f_prop = density_func(x_prop, **kwargs)
+            accept = u <= f_prop
+            samples.extend(x_prop[accept])
+        return np.array(samples[:n])
+
+sample_cache = SampleCache()
+
+# ==================== 3. Core KDE and Error Functions ====================
 def K_epanechnikov(u):
     return np.where(np.abs(u) <= 1, 0.75 * (1 - u**2), 0)
 
-# ==================== 4. Fast bandwidth selection (calibration) ====================
-
-def select_bandwidth_fast(data, x_grid, n_candidates=5):
-    """Fast bandwidth selection using a few candidates"""
-    n = len(data)
-    sigma_hat = min(np.std(data), (np.percentile(data, 75) - np.percentile(data, 25)) / 1.34)
-    h0 = 0.9 * sigma_hat * n ** (-1/5)
-    h_candidates = np.linspace(0.5*h0, 1.5*h0, n_candidates)
-    # Use a small sample for quick validation (less than 20% of data)
-    sample_size = min(50, n//5)
-    if sample_size < 10:
-        sample_size = n
-    idx_sample = np.random.choice(n, sample_size, replace=False)
-    data_sample = data[idx_sample]
-    # Calculate approximate ISE for each h
-    errors = []
-    for h in h_candidates:
-        f_kde, _ = kde_estimate(data_sample, x_grid, h)
-        # Quick reference estimate using Silverman's rule KDE
-        f_ref, _ = kde_estimate(data_sample, x_grid, None)
-        err = np.mean((f_kde - f_ref)**2)  # MSE instead of ISE to save time
-        errors.append(err)
-    best_h = h_candidates[np.argmin(errors)]
-    return best_h
-
-# ==================== 5. Core KDE functions ====================
-
 def kde_estimate(data, x_grid, h=None):
     n = len(data)
+    if n == 0:
+        return np.zeros_like(x_grid), 0.0
     if h is None:
         sigma_hat = min(np.std(data), (np.percentile(data, 75) - np.percentile(data, 25)) / 1.34)
         h = 0.9 * sigma_hat * n ** (-1/5)
@@ -104,196 +140,373 @@ def compute_errors(x_grid, f_true, f_hat):
     dx = x_grid[1] - x_grid[0]
     ise = simpson(abs_err**2, x=x_grid)
     iae = simpson(abs_err, x=x_grid)
-    mae = np.mean(abs_err)
+    mae = iae / (x_grid[-1] - x_grid[0])
     l_inf = np.max(abs_err)
     return {'ISE': ise, 'IAE': iae, 'MAE': mae, 'L_inf': l_inf}
 
-# ==================== 6. Adding noise ====================
+def select_bandwidth_cv(data, x_grid, cv_folds=5):
+    n = len(data)
+    if n < 10:
+        sigma_hat = min(np.std(data), (np.percentile(data, 75) - np.percentile(data, 25)) / 1.34)
+        return 0.9 * sigma_hat * n ** (-1/5)
+    sigma_hat = min(np.std(data), (np.percentile(data, 75) - np.percentile(data, 25)) / 1.34)
+    h0 = 0.9 * sigma_hat * n ** (-1/5)
+    h_candidates = np.linspace(0.5*h0, 1.5*h0, 10)
+    kf = KFold(n_splits=cv_folds, shuffle=True, random_state=42)
+    cv_scores = []
+    for h in h_candidates:
+        errors = []
+        for train_idx, val_idx in kf.split(data):
+            train_data = data[train_idx]
+            val_data = data[val_idx]
+            f_train, _ = kde_estimate(train_data, x_grid, h)
+            f_val, _ = kde_estimate(val_data, x_grid, h)
+            err = compute_errors(x_grid, f_val, f_train)['ISE']
+            errors.append(err)
+        cv_scores.append(np.mean(errors))
+    best_h = h_candidates[np.argmin(cv_scores)]
+    return best_h
 
-def add_noise(data, noise_level=0.05):
-    """Add Gaussian noise at a certain percentage of the data's standard deviation"""
-    sigma_data = np.std(data)
-    noise = np.random.normal(0, noise_level * sigma_data, size=len(data))
-    return data + noise
+def fit_gmm(data, n_components=2):
+    try:
+        gmm = GaussianMixture(
+            n_components=n_components,
+            max_iter=500,
+            tol=1e-4,
+            n_init=10,
+            random_state=42
+        )
+        gmm.fit(data.reshape(-1, 1))
+        return gmm
+    except Exception:
+        return None
 
-# ==================== 7. Extended analysis for future steps ====================
-
-def future_steps_analysis(R=100, sample_sizes=[50, 100, 200, 500], noise_levels=[0, 0.05, 0.1]):
-    """
-    Applying the future steps:
-    1. Simulated data with large sizes.
-    2. Different measurement types (Homodyne, Heterodyne, Squeezed).
-    3. Effect of noise.
-    4. Fast bandwidth (comparison with CV).
-    """
+# ==================== 4. Unified Analysis (5 States + Real Data) ====================
+def run_unified_analysis(
+    R=100,
+    x_range=(-6, 6),
+    grid_points=800,
+    sample_sizes=None,
+    n_ref=5000,
+    include_real_data=True
+):
     print("\n" + "="*70)
-    print("🔬 Applying the proposed future steps")
+    print("🧪 UNIFIED ANALYSIS: 5 QUANTUM STATES + REAL DATA")
     print("="*70)
 
-    # Setup grid
-    x_grid = np.linspace(-6, 6, 600)
-    results_summary = []
+    if sample_sizes is None:
+        sample_sizes = [20, 50, 100, 200, 500]
 
-    # Measurement types
-    measurements = {
-        'Homodyne (Cat)': density_cat_state,
-        'Heterodyne (Cat)': density_heterodyne,
-        'Squeezed': density_squeezed
+    x_grid = np.linspace(x_range[0], x_range[1], grid_points)
+
+    # --- Define the 6 cases (5 theoretical + 1 real) ---
+    cases = {
+        "Schrödinger Cat": {
+            "density": density_cat_state,
+            "kwargs": {"alpha": 2.0, "sigma": 1/np.sqrt(2)},
+            "x_range": (-6, 6),
+            "is_real": False
+        },
+        "Squeezed State": {
+            "density": density_squeezed,
+            "kwargs": {"alpha": 2.0, "r": 0.5},
+            "x_range": (-6, 6),
+            "is_real": False
+        },
+        "Fermionic (BCS)": {
+            "density": density_fermionic,
+            "kwargs": {"mu": 0.0, "sigma": 1.0, "delta": 0.5},
+            "x_range": (-6, 6),
+            "is_real": False
+        },
+        "Entangled (EPR)": {
+            "density": density_entangled_marginal,
+            "kwargs": {"alpha": 2.0, "sigma": 1.0, "epsilon": 0.3},
+            "x_range": (-6, 6),
+            "is_real": False
+        },
+        "Non-Gaussian Thermal": {
+            "density": density_non_gaussian_thermal,
+            "kwargs": {"mu": 0.0, "sigma": 1.0, "epsilon": 0.2, "k": 2.0},
+            "x_range": (-6, 6),
+            "is_real": False
+        }
     }
 
-    for meas_name, density_func in measurements.items():
-        print(f"\n📌 Measurement type: {meas_name}")
-        
-        # Generate reference data (large size)
-        n_ref = 5000
-        data_ref = sample_from_density(n_ref, density_func, x_range=(-8, 8))
-        f_true = density_func(x_grid)
-        f_ref, _ = kde_estimate(data_ref, x_grid)  # Accurate reference
+    # Add real data case if requested
+    real_sample_sizes = sample_sizes.copy()
+    if include_real_data:
+        url = "https://zenodo.org/records/7702950/files/cat_paper_data.h5?download=1"
+        local_file = "cat_paper_data.h5"
+        download_file(url, local_file)
+        raw_data = load_h5_data(local_file)
+        data_scaled = scale_data(raw_data, target_range=(-4, 4))
+        print(f"📊 Real data size: {len(data_scaled)}")
 
-        for noise_level in noise_levels:
-            print(f"\n   Noise level: {noise_level*100:.0f}%")
-            
-            # Reference data with noise
-            data_ref_noisy = add_noise(data_ref, noise_level)
-            f_ref_noisy, _ = kde_estimate(data_ref_noisy, x_grid)
+        # Limit sample sizes for real data to <= len(data_scaled)
+        real_sample_sizes = [s for s in sample_sizes if s <= len(data_scaled)]
+        if not real_sample_sizes:
+            real_sample_sizes = [min(20, len(data_scaled))]
+        print(f"📌 Real data sample sizes: {real_sample_sizes}")
 
-            for n in sample_sizes:
-                kde_errors = []
-                gauss_errors = []
-                gmm_errors = []
-                times_cv = []
-                times_fast = []
+        h_ref_real = select_bandwidth_cv(data_scaled, x_grid)
+        f_ref_real, _ = kde_estimate(data_scaled, x_grid, h_ref_real)
 
-                for r in range(R):
-                    # Subsample
-                    idx = np.random.choice(len(data_ref), n, replace=False)
+        cases["Real Data (Cat)"] = {
+            "density": None,
+            "kwargs": {},
+            "x_range": (-5, 5),
+            "is_real": True,
+            "data": data_scaled,
+            "f_ref": f_ref_real,
+            "h_ref": h_ref_real,
+            "sample_sizes": real_sample_sizes
+        }
+
+    all_results = {}
+
+    for case_name, case_data in cases.items():
+        print(f"\n{'='*60}")
+        print(f"🔬 Processing: {case_name}")
+        print(f"{'='*60}")
+
+        is_real = case_data.get("is_real", False)
+
+        if is_real:
+            data_ref = case_data["data"]
+            f_true = case_data["f_ref"]
+            h_ref = case_data["h_ref"]
+            xr = case_data["x_range"]
+            current_sample_sizes = case_data.get("sample_sizes", real_sample_sizes)
+            print(f"📊 Using real data: {len(data_ref)} samples")
+            print(f"📌 Reference bandwidth: {h_ref:.4f}")
+            print(f"📌 Sample sizes for this case: {current_sample_sizes}")
+        else:
+            dens_func = case_data["density"]
+            kwargs = case_data["kwargs"]
+            xr = case_data["x_range"]
+            current_sample_sizes = sample_sizes
+            print(f"📊 Generating/loading {n_ref} reference samples...")
+            data_ref = sample_cache.get(n_ref, dens_func, x_range=xr, **kwargs)
+            f_true = dens_func(x_grid, **kwargs)
+            h_ref = None
+
+        L_kde, L_gauss, L_gmm2, L_gmm4 = [], [], [], []
+        std_kde, std_gauss, std_gmm2, std_gmm4 = [], [], [], []
+        h_vals = []
+
+        for n in current_sample_sizes:
+            print(f"\n📊 n = {n} (R={R} repetitions)")
+            kde_errors, gauss_errors, gmm2_errors, gmm4_errors = [], [], [], []
+            h_list = []
+
+            for r in tqdm(range(R), desc=f"n={n}", leave=False):
+                if is_real:
+                    # Ensure we don't request more samples than available
+                    if n > len(data_ref):
+                        idx = np.random.choice(len(data_ref), n, replace=True)
+                    else:
+                        idx = np.random.choice(len(data_ref), n, replace=False)
                     data_sub = data_ref[idx]
-                    data_sub_noisy = add_noise(data_sub, noise_level)
+                else:
+                    data_sub = sample_cache.get(n, dens_func, x_range=xr, **kwargs)
 
-                    # ---- KDE with CV (slow) ----
-                    t0 = time.time()
-                    # Select h using full CV (approximately)
-                    h_cv = select_bandwidth_fast(data_sub_noisy, x_grid, n_candidates=7)  # Fast version
-                    t_cv = time.time() - t0
-                    times_cv.append(t_cv)
+                h_opt = select_bandwidth_cv(data_sub, x_grid)
+                h_list.append(h_opt)
 
-                    # ---- KDE with fast bandwidth ----
-                    t0 = time.time()
-                    h_fast = select_bandwidth_fast(data_sub_noisy, x_grid, n_candidates=3)
-                    t_fast = time.time() - t0
-                    times_fast.append(t_fast)
+                f_kde, _ = kde_estimate(data_sub, x_grid, h_opt)
+                err = compute_errors(x_grid, f_true, f_kde)
+                kde_errors.append(err['L_inf'])
 
-                    f_kde, _ = kde_estimate(data_sub_noisy, x_grid, h_fast)
-                    err_kde = compute_errors(x_grid, f_ref_noisy, f_kde)['L_inf']
-                    kde_errors.append(err_kde)
+                mu = np.mean(data_sub)
+                sigma = np.std(data_sub, ddof=0)
+                f_gauss = norm.pdf(x_grid, loc=mu, scale=sigma)
+                err = compute_errors(x_grid, f_true, f_gauss)
+                gauss_errors.append(err['L_inf'])
 
-                    # ---- Gaussian MLE ----
-                    mu = np.mean(data_sub_noisy)
-                    sigma = np.std(data_sub_noisy, ddof=0)
-                    f_gauss = norm.pdf(x_grid, loc=mu, scale=sigma)
-                    err_gauss = compute_errors(x_grid, f_ref_noisy, f_gauss)['L_inf']
-                    gauss_errors.append(err_gauss)
+                gmm2 = fit_gmm(data_sub, n_components=2)
+                if gmm2:
+                    f_gmm2 = np.exp(gmm2.score_samples(x_grid.reshape(-1, 1)))
+                    err = compute_errors(x_grid, f_true, f_gmm2)
+                    gmm2_errors.append(err['L_inf'])
+                else:
+                    gmm2_errors.append(np.nan)
 
-                    # ---- GMM ----
-                    try:
-                        gmm = GaussianMixture(n_components=2, random_state=r)
-                        gmm.fit(data_sub_noisy.reshape(-1, 1))
-                        f_gmm = np.exp(gmm.score_samples(x_grid.reshape(-1, 1)))
-                        err_gmm = compute_errors(x_grid, f_ref_noisy, f_gmm)['L_inf']
-                    except:
-                        err_gmm = np.mean(gmm_errors) if gmm_errors else 0.0
-                    gmm_errors.append(err_gmm)
+                gmm4 = fit_gmm(data_sub, n_components=4)
+                if gmm4:
+                    f_gmm4 = np.exp(gmm4.score_samples(x_grid.reshape(-1, 1)))
+                    err = compute_errors(x_grid, f_true, f_gmm4)
+                    gmm4_errors.append(err['L_inf'])
+                else:
+                    gmm4_errors.append(np.nan)
 
-                # Store results
-                results_summary.append({
-                    'Measurement': meas_name,
-                    'Noise': noise_level,
-                    'n': n,
-                    'KDE_Linf_mean': np.mean(kde_errors),
-                    'KDE_Linf_std': np.std(kde_errors, ddof=1),
-                    'Gauss_Linf_mean': np.mean(gauss_errors),
-                    'GMM_Linf_mean': np.mean(gmm_errors),
-                    'Time_CV_mean': np.mean(times_cv),
-                    'Time_Fast_mean': np.mean(times_fast)
-                })
+            def clean_mean_std(errors):
+                clean = [e for e in errors if not np.isnan(e)]
+                if not clean:
+                    return np.nan, 0.0
+                return np.mean(clean), np.std(clean, ddof=1) if len(clean) > 1 else 0.0
 
-                print(f"      n={n}: KDE L∞={np.mean(kde_errors):.4f} (±{np.std(kde_errors, ddof=1):.4f}) | "
-                      f"Gauss={np.mean(gauss_errors):.4f} | GMM={np.mean(gmm_errors):.4f} | "
-                      f"Time(CV)={np.mean(times_cv):.3f}s | Time(Fast)={np.mean(times_fast):.3f}s")
+            mean_kde, std_kde_ = clean_mean_std(kde_errors)
+            mean_gauss, std_gauss_ = clean_mean_std(gauss_errors)
+            mean_gmm2, std_gmm2_ = clean_mean_std(gmm2_errors)
+            mean_gmm4, std_gmm4_ = clean_mean_std(gmm4_errors)
+            h_mean = np.mean(h_list)
 
-    # ---- Display summary table ----
-    df = pd.DataFrame(results_summary)
+            L_kde.append(mean_kde); std_kde.append(std_kde_)
+            L_gauss.append(mean_gauss); std_gauss.append(std_gauss_)
+            L_gmm2.append(mean_gmm2); std_gmm2.append(std_gmm2_)
+            L_gmm4.append(mean_gmm4); std_gmm4.append(std_gmm4_)
+            h_vals.append(h_mean)
+
+            print(f"  KDE: L∞ = {mean_kde:.6f} (±{std_kde_:.6f})")
+            print(f"  Gauss: L∞ = {mean_gauss:.6f} (±{std_gauss_:.6f})")
+            print(f"  GMM-2: L∞ = {mean_gmm2:.6f} (±{std_gmm2_:.6f})" if not np.isnan(mean_gmm2) else "  GMM-2: failed")
+            print(f"  GMM-4: L∞ = {mean_gmm4:.6f} (±{std_gmm4_:.6f})" if not np.isnan(mean_gmm4) else "  GMM-4: failed")
+            print(f"  h = {h_mean:.5f}")
+
+        all_results[case_name] = {
+            'sample_sizes': current_sample_sizes,
+            'L_kde': L_kde, 'std_kde': std_kde,
+            'L_gauss': L_gauss, 'std_gauss': std_gauss,
+            'L_gmm2': L_gmm2, 'std_gmm2': std_gmm2,
+            'L_gmm4': L_gmm4, 'std_gmm4': std_gmm4,
+            'h_vals': h_vals,
+            'f_true': f_true,
+            'f_kde': f_kde,
+            'f_gauss': f_gauss,
+            'f_gmm2': f_gmm2 if gmm2 else None,
+            'f_gmm4': f_gmm4 if gmm4 else None,
+            'is_real': is_real
+        }
+
+    # ---- Global Comparative Table ----
     print("\n" + "="*70)
-    print("📋 Summary of results for future steps")
+    print("📋 GLOBAL COMPARISON AT n=500 (or largest available)")
     print("="*70)
-    print(df.round(4).to_string(index=False))
+
+    comp_data = []
+    for case_name, res in all_results.items():
+        n_idx = -1
+        comp_data.append({
+            'State': case_name,
+            'Real?': 'Yes' if res.get('is_real', False) else 'No',
+            'L∞_KDE': f"{res['L_kde'][n_idx]:.6f} (±{res['std_kde'][n_idx]:.6f})" if not np.isnan(res['L_kde'][n_idx]) else "failed",
+            'L∞_Gauss': f"{res['L_gauss'][n_idx]:.6f} (±{res['std_gauss'][n_idx]:.6f})" if not np.isnan(res['L_gauss'][n_idx]) else "failed",
+            'L∞_GMM-2': f"{res['L_gmm2'][n_idx]:.6f} (±{res['std_gmm2'][n_idx]:.6f})" if not np.isnan(res['L_gmm2'][n_idx]) else "failed",
+            'L∞_GMM-4': f"{res['L_gmm4'][n_idx]:.6f} (±{res['std_gmm4'][n_idx]:.6f})" if not np.isnan(res['L_gmm4'][n_idx]) else "failed"
+        })
+
+    df_comp = pd.DataFrame(comp_data)
+    print(df_comp.to_string(index=False))
 
     # ---- Plots ----
     fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-    
-    # 1. Effect of noise on KDE
-    for i, meas in enumerate(df['Measurement'].unique()):
-        sub = df[df['Measurement'] == meas]
-        for noise in noise_levels:
-            sub_n = sub[sub['Noise'] == noise]
-            axes[0,0].plot(sub_n['n'], sub_n['KDE_Linf_mean'], 'o-', 
-                          label=f'{meas} (noise={noise*100:.0f}%)')
-    axes[0,0].set_xlabel('n'); axes[0,0].set_ylabel('L∞ (KDE)')
-    axes[0,0].set_title('Effect of noise on KDE performance')
-    axes[0,0].legend(); axes[0,0].grid(True, alpha=0.3)
+    colors = ['red', 'blue', 'green', 'orange', 'purple', 'brown']
 
-    # 2. Comparison of measurement types (no noise)
-    for meas in df['Measurement'].unique():
-        sub = df[(df['Measurement'] == meas) & (df['Noise'] == 0)]
-        axes[0,1].plot(sub['n'], sub['KDE_Linf_mean'], 'o-', label=meas)
-    axes[0,1].set_xlabel('n'); axes[0,1].set_ylabel('L∞ (KDE)')
-    axes[0,1].set_title('Comparison of measurement types (no noise)')
+    # 1. L∞ Evolution
+    for i, (case_name, res) in enumerate(all_results.items()):
+        if not np.any(np.isnan(res['L_kde'])):
+            axes[0,0].errorbar(res['sample_sizes'], res['L_kde'], yerr=res['std_kde'],
+                              fmt='o-', color=colors[i % len(colors)], capsize=5, label=case_name)
+    axes[0,0].set_xlabel('Sample size n'); axes[0,0].set_ylabel('L∞ error (KDE)')
+    axes[0,0].set_title('KDE Convergence Across All Cases')
+    axes[0,0].legend(loc='best', fontsize=8); axes[0,0].grid(True, alpha=0.3)
+    axes[0,0].set_xscale('log'); axes[0,0].set_yscale('log')
+
+    # 2. Density comparison (example)
+    for case_name, res in all_results.items():
+        if not res.get('is_real', False):
+            axes[0,1].plot(x_grid, res['f_true'], 'b-', lw=2.5, label=f'True: {case_name}')
+            axes[0,1].plot(x_grid, res['f_kde'], 'r--', lw=2, label=f'KDE (n={res["sample_sizes"][-1]})')
+            break
+    axes[0,1].set_xlabel('x'); axes[0,1].set_ylabel('Density')
+    axes[0,1].set_title('Density Estimation (Example)')
     axes[0,1].legend(); axes[0,1].grid(True, alpha=0.3)
 
-    # 3. Comparison of estimators (Homodyne, no noise)
-    sub = df[(df['Measurement'] == 'Homodyne (Cat)') & (df['Noise'] == 0)]
-    axes[0,2].plot(sub['n'], sub['KDE_Linf_mean'], 'r-o', label='KDE')
-    axes[0,2].plot(sub['n'], sub['Gauss_Linf_mean'], 'g-s', label='Gaussian')
-    axes[0,2].plot(sub['n'], sub['GMM_Linf_mean'], 'b-d', label='GMM')
-    axes[0,2].set_xlabel('n'); axes[0,2].set_ylabel('L∞')
-    axes[0,2].set_title('Estimator comparison (Homodyne)')
-    axes[0,2].legend(); axes[0,2].grid(True, alpha=0.3)
+    # 3. Bar chart at largest n (use real sample sizes)
+    bar_cases = list(all_results.keys())
+    bar_kde, bar_gauss, bar_gmm2, bar_gmm4 = [], [], [], []
+    for c in bar_cases:
+        res = all_results[c]
+        n_idx = -1
+        bar_kde.append(res['L_kde'][n_idx] if not np.isnan(res['L_kde'][n_idx]) else 0)
+        bar_gauss.append(res['L_gauss'][n_idx] if not np.isnan(res['L_gauss'][n_idx]) else 0)
+        bar_gmm2.append(res['L_gmm2'][n_idx] if not np.isnan(res['L_gmm2'][n_idx]) else 0)
+        bar_gmm4.append(res['L_gmm4'][n_idx] if not np.isnan(res['L_gmm4'][n_idx]) else 0)
 
-    # 4. Bandwidth selection speed (CV vs Fast)
-    sub = df[df['Measurement'] == 'Homodyne (Cat)']
-    axes[1,0].plot(sub['n'], sub['Time_CV_mean'], 'r-o', label='CV (approximate)')
-    axes[1,0].plot(sub['n'], sub['Time_Fast_mean'], 'b-s', label='Fast (calibration)')
-    axes[1,0].set_xlabel('n'); axes[1,0].set_ylabel('Time (seconds)')
-    axes[1,0].set_title('Bandwidth selection speed')
-    axes[1,0].legend(); axes[1,0].grid(True, alpha=0.3)
+    x_pos = np.arange(len(bar_cases))
+    width = 0.2
+    axes[0,2].bar(x_pos - 1.5*width, bar_kde, width, label='KDE', color='red', alpha=0.7)
+    axes[0,2].bar(x_pos - 0.5*width, bar_gauss, width, label='Gaussian MLE', color='green', alpha=0.7)
+    axes[0,2].bar(x_pos + 0.5*width, bar_gmm2, width, label='GMM-2', color='blue', alpha=0.7)
+    axes[0,2].bar(x_pos + 1.5*width, bar_gmm4, width, label='GMM-4', color='orange', alpha=0.7)
+    axes[0,2].set_xticks(x_pos); axes[0,2].set_xticklabels(bar_cases, rotation=15, ha='right', fontsize=8)
+    axes[0,2].set_ylabel('L∞ error (largest n)')
+    axes[0,2].set_title('Estimator Comparison')
+    axes[0,2].legend(); axes[0,2].grid(True, alpha=0.3, axis='y')
 
-    # 5. Effect of noise on estimators (Homodyne, n=200)
-    sub = df[df['Measurement'] == 'Homodyne (Cat)']
-    sub_n = sub[sub['n'] == 200]
-    axes[1,1].plot(sub_n['Noise'], sub_n['KDE_Linf_mean'], 'r-o', label='KDE')
-    axes[1,1].plot(sub_n['Noise'], sub_n['Gauss_Linf_mean'], 'g-s', label='Gaussian')
-    axes[1,1].plot(sub_n['Noise'], sub_n['GMM_Linf_mean'], 'b-d', label='GMM')
-    axes[1,1].set_xlabel('Noise level'); axes[1,1].set_ylabel('L∞ (n=200)')
-    axes[1,1].set_title('Effect of noise on estimators')
-    axes[1,1].legend(); axes[1,1].grid(True, alpha=0.3)
+    # 4. Bandwidth evolution
+    for i, (case_name, res) in enumerate(all_results.items()):
+        axes[1,0].plot(res['sample_sizes'], res['h_vals'], 'o-', color=colors[i % len(colors)], label=case_name)
+    axes[1,0].set_xlabel('Sample size n'); axes[1,0].set_ylabel('Bandwidth h')
+    axes[1,0].set_title('Bandwidth Evolution')
+    axes[1,0].legend(loc='best', fontsize=8); axes[1,0].grid(True, alpha=0.3)
+    axes[1,0].set_xscale('log')
 
-    # 6. Variance vs noise level
-    axes[1,2].plot(sub['Noise'], sub['KDE_Linf_std'], 'r-o', label='KDE std')
-    axes[1,2].set_xlabel('Noise level'); axes[1,2].set_ylabel('Standard deviation')
-    axes[1,2].set_title('Stability of KDE vs noise')
-    axes[1,2].grid(True, alpha=0.3)
+    # 5. Log-log slopes
+    from scipy.stats import linregress
+    slopes = []
+    for case_name, res in all_results.items():
+        log_n = np.log(res['sample_sizes'])
+        log_err = np.log(res['L_kde'])
+        mask = np.isfinite(log_err)
+        if np.sum(mask) >= 3:
+            slope, _, _, _, _ = linregress(log_n[mask], log_err[mask])
+        else:
+            slope = np.nan
+        slopes.append(slope)
+    axes[1,1].bar(bar_cases, slopes, color=colors[:len(bar_cases)])
+    axes[1,1].set_ylabel('Log-Log Slope (KDE)')
+    axes[1,1].set_title('Convergence Rates (Theoretical: -0.4)')
+    axes[1,1].axhline(y=-0.4, color='k', linestyle='--', label='Theoretical -0.4')
+    axes[1,1].legend(); axes[1,1].grid(True, alpha=0.3, axis='y')
+    axes[1,1].set_xticklabels(bar_cases, rotation=15, ha='right', fontsize=8)
+
+    # 6. KDE vs Gaussian ratio
+    ratios = []
+    for c in bar_cases:
+        res = all_results[c]
+        n_idx = -1
+        kde_val = res['L_kde'][n_idx] if not np.isnan(res['L_kde'][n_idx]) else np.nan
+        gauss_val = res['L_gauss'][n_idx] if not np.isnan(res['L_gauss'][n_idx]) else np.nan
+        if not np.isnan(kde_val) and not np.isnan(gauss_val) and gauss_val > 0:
+            ratios.append(kde_val / gauss_val)
+        else:
+            ratios.append(np.nan)
+    axes[1,2].bar(bar_cases, ratios, color=['red' if r < 1 else 'gray' for r in ratios if not np.isnan(r)])
+    axes[1,2].set_ylabel('KDE / Gaussian MLE (largest n)')
+    axes[1,2].set_title('Performance Ratio (lower = better KDE)')
+    axes[1,2].axhline(y=1, color='k', linestyle='--', label='Equal performance')
+    axes[1,2].legend(); axes[1,2].grid(True, alpha=0.3, axis='y')
+    axes[1,2].set_xticklabels(bar_cases, rotation=15, ha='right', fontsize=8)
 
     plt.tight_layout()
+    plt.savefig('unified_quantum_states_analysis.png', dpi=300, bbox_inches='tight')
     plt.show()
 
-    return df
+    print("\n" + "="*70)
+    print("✅ Unified analysis completed successfully.")
+    print("="*70)
 
-# ==================== 8. Execute the analysis ====================
+    return all_results
+
+# ==================== 5. Execute ====================
 if __name__ == "__main__":
-    print("🚀 Starting the proposed future steps analysis")
-    results_df = future_steps_analysis(
-        R=50,  # Number of repetitions (reduced to save time)
-        sample_sizes=[50, 100, 200, 500],
-        noise_levels=[0, 0.05, 0.1]
+    print("🚀 Starting unified analysis with caching and real data")
+    results = run_unified_analysis(
+        R=100,
+        sample_sizes=[20, 50, 100, 200, 500],
+        n_ref=5000,
+        include_real_data=True
     )
-    print("\n✅ Future analysis completed successfully.")
+    print("\n✅ All simulations completed.")
